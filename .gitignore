@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Environment Variables (Secrets)
+.env
+
+# Build outputs
+dist/
+build/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Docker (Optional, usually we keep these but ignore logs)
+*.log
