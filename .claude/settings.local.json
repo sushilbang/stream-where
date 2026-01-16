@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /c/Users/sushi/desktop/projects/stream-where log --oneline --all)"
+    ]
+  }
+}
