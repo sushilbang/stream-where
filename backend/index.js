@@ -15,6 +15,32 @@ const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const cache = new Map();
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
 
+// API usage tracking
+const apiUsage = {
+    rapidApi: { remaining: null, limit: null, resetDate: null },
+    omdb: { dailyCount: 0, lastReset: Date.now() }
+};
+
+// Check if OMDb daily limit should reset (resets daily)
+function checkOmdbReset() {
+    const now = Date.now();
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    if (now - apiUsage.omdb.lastReset > oneDayMs) {
+        apiUsage.omdb.dailyCount = 0;
+        apiUsage.omdb.lastReset = now;
+    }
+}
+
+// Parse RapidAPI rate limit headers
+function updateRapidApiUsage(headers) {
+    if (headers['x-ratelimit-requests-remaining']) {
+        apiUsage.rapidApi.remaining = parseInt(headers['x-ratelimit-requests-remaining']);
+    }
+    if (headers['x-ratelimit-requests-limit']) {
+        apiUsage.rapidApi.limit = parseInt(headers['x-ratelimit-requests-limit']);
+    }
+}
+
 function getFromCache(key) {
     const cached = cache.get(key);
     if (!cached) return null;
@@ -51,10 +77,22 @@ app.get('/api/search', async (req, res) => {
     }
 
     try {
+        checkOmdbReset();
         const url = `http://www.omdbapi.com/?apikey=${OMDB_KEY}&s=${query}`;
         const response = await axios.get(url);
+        apiUsage.omdb.dailyCount++;
 
+        // OMDb returns errors in response body, not HTTP status
         if (response.data.Error) {
+            // Check for rate limit error
+            if (response.data.Error.includes('limit') || response.data.Error.includes('Request limit')) {
+                console.error("OMDb Rate Limit:", response.data.Error);
+                return res.status(429).json({
+                    error: "OMDb daily limit reached (1000 requests/day)",
+                    rateLimited: true,
+                    service: "omdb"
+                });
+            }
             return res.json([]);
         }
 
@@ -70,6 +108,9 @@ app.get('/api/search', async (req, res) => {
         res.json(results);
     } catch (error) {
         console.error("OMDb Error:", error.message);
+        if (error.response?.status === 401) {
+            return res.status(401).json({ error: "Invalid OMDb API key" });
+        }
         res.status(500).json({ error: "Search failed" });
     }
 });
@@ -99,6 +140,10 @@ app.get('/api/providers/:imdbId', async (req, res) => {
         };
 
         const response = await axios.request(options);
+
+        // Update usage tracking from response headers
+        updateRapidApiUsage(response.headers);
+
         const indiaOptions = response.data.streamingOptions?.in || [];
 
         // Filter by type
@@ -117,7 +162,35 @@ app.get('/api/providers/:imdbId', async (req, res) => {
         res.json(result);
 
     } catch (error) {
-        console.error("RapidAPI Error:", error.response?.status, error.message);
+        const status = error.response?.status;
+        console.error("RapidAPI Error:", status, error.message);
+
+        // Handle rate limiting (429) and quota exceeded (402/403)
+        if (status === 429) {
+            return res.status(429).json({
+                error: "RapidAPI rate limit exceeded. Please try again later.",
+                rateLimited: true,
+                service: "rapidapi"
+            });
+        }
+        if (status === 402) {
+            return res.status(402).json({
+                error: "RapidAPI monthly quota exceeded (1000 requests/month)",
+                rateLimited: true,
+                service: "rapidapi"
+            });
+        }
+        if (status === 403) {
+            return res.status(403).json({
+                error: "RapidAPI access denied. Check your API key or subscription.",
+                service: "rapidapi"
+            });
+        }
+        if (status === 404) {
+            // Movie not found in streaming database - this is normal
+            return res.json({ flatrate: [], rent: [], buy: [], notFound: true });
+        }
+
         res.json({ flatrate: [], rent: [], buy: [], message: "Provider data unavailable" });
     }
 });
@@ -143,6 +216,8 @@ async function getProvidersForMovie(imdbId) {
         };
 
         const response = await axios.request(options);
+        updateRapidApiUsage(response.headers);
+
         const indiaOptions = response.data.streamingOptions?.in || [];
         const flatrate = indiaOptions.filter(opt => opt.type === 'subscription');
 
@@ -155,7 +230,17 @@ async function getProvidersForMovie(imdbId) {
         setCache(cacheKey, result);
         return result;
     } catch (error) {
-        console.error("RapidAPI Error:", error.message);
+        const status = error.response?.status;
+        console.error("RapidAPI Error:", status, error.message);
+
+        // Throw rate limit errors so bundle endpoint can handle them
+        if (status === 429 || status === 402) {
+            const err = new Error(status === 429 ? 'Rate limit exceeded' : 'Monthly quota exceeded');
+            err.rateLimited = true;
+            err.status = status;
+            throw err;
+        }
+
         return { flatrate: [], rent: [], buy: [] };
     }
 }
@@ -272,8 +357,42 @@ app.post('/api/bundle', async (req, res) => {
 
     } catch (error) {
         console.error("Bundle Error:", error.message);
+
+        // Handle rate limit errors from helper functions
+        if (error.rateLimited) {
+            const statusCode = error.status === 429 ? 429 : 402;
+            return res.status(statusCode).json({
+                error: error.status === 429
+                    ? "RapidAPI rate limit exceeded. Please try again later."
+                    : "RapidAPI monthly quota exceeded (1000 requests/month)",
+                rateLimited: true,
+                service: "rapidapi"
+            });
+        }
+
         res.status(500).json({ error: "Failed to analyze movies" });
     }
+});
+
+// 4. API Status - Check rate limits and usage
+app.get('/api/status', (req, res) => {
+    checkOmdbReset();
+    res.json({
+        rapidApi: {
+            remaining: apiUsage.rapidApi.remaining,
+            limit: apiUsage.rapidApi.limit,
+            note: "1000 requests/month on free tier"
+        },
+        omdb: {
+            estimatedDailyUsage: apiUsage.omdb.dailyCount,
+            limit: 1000,
+            note: "1000 requests/day on free tier"
+        },
+        cache: {
+            entries: cache.size,
+            ttlHours: 24
+        }
+    });
 });
 
 app.listen(PORT, () => {
