@@ -39,18 +39,17 @@ app.get('/api/search', async (req, res) => {
     }
 });
 
-// 2. Get Streaming Providers (Using RapidAPI)
+// 2. Get Streaming Providers (RapidAPI v4)
 app.get('/api/providers/:imdbId', async (req, res) => {
     const { imdbId } = req.params;
 
     try {
         const options = {
             method: 'GET',
-            url: 'https://streaming-availability.p.rapidapi.com/get/basic',
+            url: `https://streaming-availability.p.rapidapi.com/shows/${imdbId}`,
             params: {
-                country: 'in', // Look specifically in INDIA
-                imdb_id: imdbId,
-                output_language: 'en'
+                output_language: 'en',
+                series_granularity: 'show'
             },
             headers: {
                 'X-RapidAPI-Key': RAPIDAPI_KEY,
@@ -59,23 +58,22 @@ app.get('/api/providers/:imdbId', async (req, res) => {
         };
 
         const response = await axios.request(options);
-        const streamingData = response.data.result?.streamingInfo?.in || [];
+        const indiaOptions = response.data.streamingOptions?.in || [];
 
-        // Group them into "Flatrate" (Subscription), "Rent", "Buy"
-        const flatrate = streamingData.filter(s => s.streamingType === 'subscription' || s.streamingType === 'addon');
-        const rent = streamingData.filter(s => s.streamingType === 'rent');
-        const buy = streamingData.filter(s => s.streamingType === 'buy');
+        // Filter by type
+        const flatrate = indiaOptions.filter(opt => opt.type === 'subscription');
+        const rent = indiaOptions.filter(opt => opt.type === 'rent');
+        const buy = indiaOptions.filter(opt => opt.type === 'buy');
 
         res.json({
-            link: response.data.result?.imdbLink || "", // Link back to IMDb
+            link: response.data.imdbLink || "", 
             flatrate: flatrate,
             rent: rent,
             buy: buy
         });
 
     } catch (error) {
-        console.error("RapidAPI Error:", error.message);
-        // Don't crash the app, just return empty availability
+        console.error("RapidAPI Error:", error.response?.status, error.message);
         res.json({ flatrate: [], rent: [], buy: [], message: "Provider data unavailable" });
     }
 });
